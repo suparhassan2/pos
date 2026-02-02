@@ -289,6 +289,17 @@ class ReconciliationTool:
             if ('qty' in col_lower or 'quantity' in col_lower) and 'Quantity' not in column_mapping.values():
                 column_mapping[col] = 'Quantity'
         
+        # Call/Put: "Call / Put" (exact match first)
+        if 'Call / Put' in df.columns:
+            column_mapping['Call / Put'] = 'Call_Put'
+        else:
+            # Fall back to flexible matching
+            for col in df.columns:
+                col_lower = col.lower()
+                if ('call' in col_lower or 'put' in col_lower) and 'Call_Put' not in column_mapping.values():
+                    column_mapping[col] = 'Call_Put'
+                    break
+        
         df = df.rename(columns=column_mapping)
         
         # Log which columns were used
@@ -310,29 +321,56 @@ class ReconciliationTool:
         df['Settlement_Price'] = pd.to_numeric(df['Settlement_Price'], errors='coerce')
         df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
         
-        # Remove rows with missing critical data
-        initial_count = len(df)
-        df = df.dropna(subset=['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity'])
-        if len(df) < initial_count:
-            self.logger.warning(f"Removed {initial_count - len(df)} rows with missing data from XTP")
+        # Normalize Call/Put values: Call -> C, Put -> P, blank/other -> None
+        if 'Call_Put' in df.columns:
+            df['Call_Put'] = df['Call_Put'].astype(str).str.strip().str.upper()
+            # Map Call to C, Put to P, everything else to None
+            df['Call_Put_Normalized'] = df['Call_Put'].apply(
+                lambda x: 'C' if x == 'CALL' else ('P' if x == 'PUT' else None)
+            )
+        else:
+            df['Call_Put'] = None
+            df['Call_Put_Normalized'] = None
         
-        # Apply multipliers
-        df['Strike_Multiplier'] = df['Product_Code'].apply(
-            lambda x: self.get_multiplier(x, 'strike')
-        )
-        df['Settle_Multiplier'] = df['Product_Code'].apply(
-            lambda x: self.get_multiplier(x, 'settle')
-        )
+        # Identify rows with missing critical data (but keep them)
+        critical_cols = ['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity']
+        df['_is_complete'] = df[critical_cols].notna().all(axis=1)
         
-        df['Strike_Price_Adjusted'] = df['Strike_Price'] * df['Strike_Multiplier']
-        df['Settlement_Price_Adjusted'] = df['Settlement_Price'] * df['Settle_Multiplier']
+        # Separate complete and incomplete records
+        df_complete = df[df['_is_complete']].copy()
+        df_incomplete = df[~df['_is_complete']].copy()
         
-        # Round adjusted prices for matching
-        df['Strike_Price_Adjusted'] = df['Strike_Price_Adjusted'].round(2)
-        df['Settlement_Price_Adjusted'] = df['Settlement_Price_Adjusted'].round(2)
+        if len(df_incomplete) > 0:
+            self.logger.info(f"Found {len(df_incomplete)} XTP records with missing data (will be in separate tab)")
         
-        self.logger.info(f"Prepared {len(df)} XTP records")
-        return df
+        # Apply multipliers only to complete records
+        if len(df_complete) > 0:
+            df_complete['Strike_Multiplier'] = df_complete['Product_Code'].apply(
+                lambda x: self.get_multiplier(x, 'strike')
+            )
+            df_complete['Settle_Multiplier'] = df_complete['Product_Code'].apply(
+                lambda x: self.get_multiplier(x, 'settle')
+            )
+            
+            df_complete['Strike_Price_Adjusted'] = df_complete['Strike_Price'] * df_complete['Strike_Multiplier']
+            df_complete['Settlement_Price_Adjusted'] = df_complete['Settlement_Price'] * df_complete['Settle_Multiplier']
+            
+            # Round adjusted prices for matching
+            df_complete['Strike_Price_Adjusted'] = df_complete['Strike_Price_Adjusted'].round(2)
+            df_complete['Settlement_Price_Adjusted'] = df_complete['Settlement_Price_Adjusted'].round(2)
+        
+        # Add placeholder columns for incomplete records
+        if len(df_incomplete) > 0:
+            df_incomplete['Strike_Multiplier'] = None
+            df_incomplete['Settle_Multiplier'] = None
+            df_incomplete['Strike_Price_Adjusted'] = None
+            df_incomplete['Settlement_Price_Adjusted'] = None
+        
+        # Combine back but mark which are incomplete
+        df_result = pd.concat([df_complete, df_incomplete], ignore_index=True)
+        
+        self.logger.info(f"Prepared {len(df_complete)} complete XTP records, {len(df_incomplete)} incomplete records")
+        return df_result
     
     def prepare_jpm_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -400,6 +438,17 @@ class ReconciliationTool:
             if ('qty' in col_lower or 'quantity' in col_lower) and 'Quantity' not in column_mapping.values():
                 column_mapping[col] = 'Quantity'
         
+        # Call/Put: "Call / Put" (exact match first)
+        if 'Call / Put' in df.columns:
+            column_mapping['Call / Put'] = 'Call_Put'
+        else:
+            # Fall back to flexible matching
+            for col in df.columns:
+                col_lower = col.lower()
+                if ('call' in col_lower or 'put' in col_lower) and 'Call_Put' not in column_mapping.values():
+                    column_mapping[col] = 'Call_Put'
+                    break
+        
         df = df.rename(columns=column_mapping)
         
         # Log which columns were used
@@ -419,29 +468,56 @@ class ReconciliationTool:
         df['Settlement_Price'] = pd.to_numeric(df['Settlement_Price'], errors='coerce')
         df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
         
-        # Remove rows with missing critical data
-        initial_count = len(df)
-        df = df.dropna(subset=['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity'])
-        if len(df) < initial_count:
-            self.logger.warning(f"Removed {initial_count - len(df)} rows with missing data from JPM")
+        # Normalize Call/Put values: C stays C, P stays P, blank/other -> None
+        if 'Call_Put' in df.columns:
+            df['Call_Put'] = df['Call_Put'].astype(str).str.strip().str.upper()
+            # Map C to C, P to P, everything else to None
+            df['Call_Put_Normalized'] = df['Call_Put'].apply(
+                lambda x: 'C' if x == 'C' else ('P' if x == 'P' else None)
+            )
+        else:
+            df['Call_Put'] = None
+            df['Call_Put_Normalized'] = None
         
-        # Apply multipliers
-        df['Strike_Multiplier'] = df['Product_Code'].apply(
-            lambda x: self.get_multiplier(x, 'strike')
-        )
-        df['Settle_Multiplier'] = df['Product_Code'].apply(
-            lambda x: self.get_multiplier(x, 'settle')
-        )
+        # Identify rows with missing critical data (but keep them)
+        critical_cols = ['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity']
+        df['_is_complete'] = df[critical_cols].notna().all(axis=1)
         
-        df['Strike_Price_Adjusted'] = df['Strike_Price'] * df['Strike_Multiplier']
-        df['Settlement_Price_Adjusted'] = df['Settlement_Price'] * df['Settle_Multiplier']
+        # Separate complete and incomplete records
+        df_complete = df[df['_is_complete']].copy()
+        df_incomplete = df[~df['_is_complete']].copy()
         
-        # Round adjusted prices for matching
-        df['Strike_Price_Adjusted'] = df['Strike_Price_Adjusted'].round(2)
-        df['Settlement_Price_Adjusted'] = df['Settlement_Price_Adjusted'].round(2)
+        if len(df_incomplete) > 0:
+            self.logger.info(f"Found {len(df_incomplete)} JPM records with missing data (will be in separate tab)")
         
-        self.logger.info(f"Prepared {len(df)} JPM records")
-        return df
+        # Apply multipliers only to complete records
+        if len(df_complete) > 0:
+            df_complete['Strike_Multiplier'] = df_complete['Product_Code'].apply(
+                lambda x: self.get_multiplier(x, 'strike')
+            )
+            df_complete['Settle_Multiplier'] = df_complete['Product_Code'].apply(
+                lambda x: self.get_multiplier(x, 'settle')
+            )
+            
+            df_complete['Strike_Price_Adjusted'] = df_complete['Strike_Price'] * df_complete['Strike_Multiplier']
+            df_complete['Settlement_Price_Adjusted'] = df_complete['Settlement_Price'] * df_complete['Settle_Multiplier']
+            
+            # Round adjusted prices for matching
+            df_complete['Strike_Price_Adjusted'] = df_complete['Strike_Price_Adjusted'].round(2)
+            df_complete['Settlement_Price_Adjusted'] = df_complete['Settlement_Price_Adjusted'].round(2)
+        
+        # Add placeholder columns for incomplete records
+        if len(df_incomplete) > 0:
+            df_incomplete['Strike_Multiplier'] = None
+            df_incomplete['Settle_Multiplier'] = None
+            df_incomplete['Strike_Price_Adjusted'] = None
+            df_incomplete['Settlement_Price_Adjusted'] = None
+        
+        # Combine back but mark which are incomplete
+        df_result = pd.concat([df_complete, df_incomplete], ignore_index=True)
+        
+        self.logger.info(f"Prepared {len(df_complete)} complete JPM records, {len(df_incomplete)} incomplete records")
+        return df_result
     
     def aggregate_positions(self, df: pd.DataFrame, source: str) -> pd.DataFrame:
         """
@@ -456,27 +532,52 @@ class ReconciliationTool:
         """
         self.logger.info(f"Aggregating {source} positions...")
         
+        # Include Call_Put_Normalized in grouping if it exists
         group_cols = ['Account', 'Product_Code', 'Strike_Price_Adjusted', 'Settlement_Price_Adjusted']
+        if 'Call_Put_Normalized' in df.columns:
+            group_cols.append('Call_Put_Normalized')
         
         # Aggregate quantities
-        agg_df = df.groupby(group_cols, as_index=False).agg({
+        agg_dict = {
             'Quantity': 'sum',
             'Strike_Price': 'first',  # Keep original strike price for display
             'Settlement_Price': 'first',  # Keep original settlement price for display
             'Strike_Multiplier': 'first',
             'Settle_Multiplier': 'first'
-        })
+        }
+        
+        # Add Call_Put fields if they exist
+        if 'Call_Put' in df.columns:
+            agg_dict['Call_Put'] = 'first'
+        if 'Call_Put_Normalized' in df.columns:
+            agg_dict['Call_Put_Normalized'] = 'first'
+        
+        agg_df = df.groupby(group_cols, as_index=False).agg(agg_dict)
         
         # Store detail records for later breakdown
-        agg_df['_detail_records'] = agg_df.apply(
-            lambda row: df[
-                (df['Account'] == row['Account']) &
-                (df['Product_Code'] == row['Product_Code']) &
-                (df['Strike_Price_Adjusted'] == row['Strike_Price_Adjusted']) &
+        def get_detail_records(row):
+            conditions = [
+                (df['Account'] == row['Account']),
+                (df['Product_Code'] == row['Product_Code']),
+                (df['Strike_Price_Adjusted'] == row['Strike_Price_Adjusted']),
                 (df['Settlement_Price_Adjusted'] == row['Settlement_Price_Adjusted'])
-            ].to_dict('records'),
-            axis=1
-        )
+            ]
+            if 'Call_Put_Normalized' in df.columns and 'Call_Put_Normalized' in row.index:
+                # Match Call_Put_Normalized: if either is None, allow match; otherwise must match exactly
+                row_call_put = row.get('Call_Put_Normalized')
+                if pd.isna(row_call_put) or row_call_put is None:
+                    # Row has None, so match any Call_Put_Normalized
+                    pass  # Don't filter by Call_Put
+                else:
+                    # Row has value, match exact or None
+                    call_put_condition = (
+                        (df['Call_Put_Normalized'].fillna('*') == row_call_put) |
+                        (df['Call_Put_Normalized'].isna())
+                    )
+                    conditions.append(call_put_condition)
+            return df[pd.concat(conditions, axis=1).all(axis=1)].to_dict('records')
+        
+        agg_df['_detail_records'] = agg_df.apply(get_detail_records, axis=1)
         
         self.logger.info(f"Aggregated {len(df)} {source} records into {len(agg_df)} groups")
         return agg_df
@@ -511,74 +612,168 @@ class ReconciliationTool:
         xtp_df = self.prepare_xtp_data(xtp_raw)
         jpm_df = self.prepare_jpm_data(jpm_raw)
         
-        # Aggregate positions
-        xtp_agg = self.aggregate_positions(xtp_df, 'XTP')
-        jpm_agg = self.aggregate_positions(jpm_df, 'JPM')
+        # Separate complete and incomplete records
+        xtp_complete = xtp_df[xtp_df['_is_complete']].copy() if '_is_complete' in xtp_df.columns else xtp_df
+        xtp_incomplete = xtp_df[~xtp_df['_is_complete']].copy() if '_is_complete' in xtp_df.columns else pd.DataFrame()
         
-        # Create matching keys
-        xtp_agg['Match_Key'] = (
-            xtp_agg['Account'].astype(str) + '|' +
-            xtp_agg['Product_Code'].astype(str) + '|' +
-            xtp_agg['Strike_Price_Adjusted'].astype(str) + '|' +
-            xtp_agg['Settlement_Price_Adjusted'].astype(str)
-        )
+        jpm_complete = jpm_df[jpm_df['_is_complete']].copy() if '_is_complete' in jpm_df.columns else jpm_df
+        jpm_incomplete = jpm_df[~jpm_df['_is_complete']].copy() if '_is_complete' in jpm_df.columns else pd.DataFrame()
         
-        jpm_agg['Match_Key'] = (
-            jpm_agg['Account'].astype(str) + '|' +
-            jpm_agg['Product_Code'].astype(str) + '|' +
-            jpm_agg['Strike_Price_Adjusted'].astype(str) + '|' +
-            jpm_agg['Settlement_Price_Adjusted'].astype(str)
-        )
+        # Aggregate positions (only complete records)
+        xtp_agg = self.aggregate_positions(xtp_complete, 'XTP') if len(xtp_complete) > 0 else pd.DataFrame()
+        jpm_agg = self.aggregate_positions(jpm_complete, 'JPM') if len(jpm_complete) > 0 else pd.DataFrame()
+        
+        # Create matching keys and merge (only if we have data)
+        # Include Call_Put_Normalized in match key: if None/blank, use '*' to match with anything
+        # If both have C or P, they must match exactly
+        if len(xtp_agg) > 0:
+            if 'Call_Put_Normalized' in xtp_agg.columns:
+                # Use '*' for None/blank (matches with anything), actual value for C/P
+                call_put_key = xtp_agg['Call_Put_Normalized'].fillna('*').astype(str)
+            else:
+                call_put_key = pd.Series(['*'] * len(xtp_agg))
+            
+            xtp_agg['Match_Key'] = (
+                xtp_agg['Account'].astype(str) + '|' +
+                xtp_agg['Product_Code'].astype(str) + '|' +
+                xtp_agg['Strike_Price_Adjusted'].astype(str) + '|' +
+                xtp_agg['Settlement_Price_Adjusted'].astype(str) + '|' +
+                call_put_key
+            )
+        
+        if len(jpm_agg) > 0:
+            if 'Call_Put_Normalized' in jpm_agg.columns:
+                # Use '*' for None/blank (matches with anything), actual value for C/P
+                call_put_key = jpm_agg['Call_Put_Normalized'].fillna('*').astype(str)
+            else:
+                call_put_key = pd.Series(['*'] * len(jpm_agg))
+            
+            jpm_agg['Match_Key'] = (
+                jpm_agg['Account'].astype(str) + '|' +
+                jpm_agg['Product_Code'].astype(str) + '|' +
+                jpm_agg['Strike_Price_Adjusted'].astype(str) + '|' +
+                jpm_agg['Settlement_Price_Adjusted'].astype(str) + '|' +
+                call_put_key
+            )
         
         # Merge for comparison
-        merged = pd.merge(
-            xtp_agg,
-            jpm_agg,
-            on='Match_Key',
-            how='outer',
-            suffixes=('_XTP', '_JPM')
-        )
+        # Use base match key (without Call/Put) and then filter by Call/Put rules
+        if len(xtp_agg) > 0:
+            xtp_agg['Base_Match_Key'] = (
+                xtp_agg['Account'].astype(str) + '|' +
+                xtp_agg['Product_Code'].astype(str) + '|' +
+                xtp_agg['Strike_Price_Adjusted'].astype(str) + '|' +
+                xtp_agg['Settlement_Price_Adjusted'].astype(str)
+            )
         
-        # Fill missing quantities with 0
-        merged['Quantity_XTP'] = merged['Quantity_XTP'].fillna(0)
-        merged['Quantity_JPM'] = merged['Quantity_JPM'].fillna(0)
+        if len(jpm_agg) > 0:
+            jpm_agg['Base_Match_Key'] = (
+                jpm_agg['Account'].astype(str) + '|' +
+                jpm_agg['Product_Code'].astype(str) + '|' +
+                jpm_agg['Strike_Price_Adjusted'].astype(str) + '|' +
+                jpm_agg['Settlement_Price_Adjusted'].astype(str)
+            )
         
-        # Calculate difference
-        merged['Quantity_Difference'] = merged['Quantity_XTP'] - merged['Quantity_JPM']
+        if len(xtp_agg) > 0 and len(jpm_agg) > 0:
+            # Merge on base key first
+            merged = pd.merge(
+                xtp_agg,
+                jpm_agg,
+                on='Base_Match_Key',
+                how='outer',
+                suffixes=('_XTP', '_JPM')
+            )
+            
+            # Apply Call/Put matching rules:
+            # - If both have C or P, they must match exactly
+            # - If either is None/blank, allow match (ignore Call/Put rule)
+            xtp_call_put = merged.get('Call_Put_Normalized_XTP', pd.Series([None] * len(merged)))
+            jpm_call_put = merged.get('Call_Put_Normalized_JPM', pd.Series([None] * len(merged)))
+            
+            # Fill None with '*' for comparison
+            xtp_call_put_filled = xtp_call_put.fillna('*')
+            jpm_call_put_filled = jpm_call_put.fillna('*')
+            
+            # Filter: keep rows where Call/Put matches OR either side is '*'
+            call_put_match = (
+                (xtp_call_put_filled == '*') |  # XTP is blank/None
+                (jpm_call_put_filled == '*') |  # JPM is blank/None
+                (xtp_call_put_filled == jpm_call_put_filled)  # Both match exactly
+            )
+            
+            # Keep only rows that match Call/Put rules
+            merged = merged[call_put_match].copy()
+        elif len(xtp_agg) > 0:
+            merged = xtp_agg.copy()
+            merged['Quantity_JPM'] = 0
+            merged['Match_Key'] = merged.get('Match_Key', '')
+        elif len(jpm_agg) > 0:
+            merged = jpm_agg.copy()
+            merged['Quantity_XTP'] = 0
+            merged['Match_Key'] = merged.get('Match_Key', '')
+        else:
+            merged = pd.DataFrame()
         
-        # Determine match status
-        def get_status(row):
-            if pd.isna(row['Quantity_XTP']) or row['Quantity_XTP'] == 0:
-                return 'JPM Only'
-            elif pd.isna(row['Quantity_JPM']) or row['Quantity_JPM'] == 0:
-                return 'XTP Only'
+        # Process merged data only if not empty
+        if len(merged) > 0:
+            # Fill missing quantities with 0
+            if 'Quantity_XTP' in merged.columns:
+                merged['Quantity_XTP'] = merged['Quantity_XTP'].fillna(0)
             else:
-                diff = abs(row['Quantity_Difference'])
-                if diff <= self.qty_tolerance:
-                    return 'Matched'
-                elif self.qty_percent_tolerance > 0:
-                    max_qty = max(abs(row['Quantity_XTP']), abs(row['Quantity_JPM']))
-                    if max_qty > 0 and (diff / max_qty) <= self.qty_percent_tolerance:
+                merged['Quantity_XTP'] = 0
+            
+            if 'Quantity_JPM' in merged.columns:
+                merged['Quantity_JPM'] = merged['Quantity_JPM'].fillna(0)
+            else:
+                merged['Quantity_JPM'] = 0
+            
+            # Calculate difference
+            merged['Quantity_Difference'] = merged['Quantity_XTP'] - merged['Quantity_JPM']
+            
+            # Determine match status
+            def get_status(row):
+                if pd.isna(row.get('Quantity_XTP', 0)) or row.get('Quantity_XTP', 0) == 0:
+                    return 'JPM Only'
+                elif pd.isna(row.get('Quantity_JPM', 0)) or row.get('Quantity_JPM', 0) == 0:
+                    return 'XTP Only'
+                else:
+                    diff = abs(row.get('Quantity_Difference', 0))
+                    if diff <= self.qty_tolerance:
                         return 'Matched'
-                return 'Qty Mismatch'
-        
-        merged['Status'] = merged.apply(get_status, axis=1)
-        
-        # Extract common columns for display
-        merged['Account'] = merged['Account_XTP'].fillna(merged['Account_JPM'])
-        merged['Product_Code'] = merged['Product_Code_XTP'].fillna(merged['Product_Code_JPM'])
-        merged['Strike_Price_Adjusted'] = merged['Strike_Price_Adjusted_XTP'].fillna(
-            merged['Strike_Price_Adjusted_JPM']
-        )
-        merged['Settlement_Price_Adjusted'] = merged['Settlement_Price_Adjusted_XTP'].fillna(
-            merged['Settlement_Price_Adjusted_JPM']
-        )
+                    elif self.qty_percent_tolerance > 0:
+                        max_qty = max(abs(row.get('Quantity_XTP', 0)), abs(row.get('Quantity_JPM', 0)))
+                        if max_qty > 0 and (diff / max_qty) <= self.qty_percent_tolerance:
+                            return 'Matched'
+                    return 'Qty Mismatch'
+            
+            merged['Status'] = merged.apply(get_status, axis=1)
+            
+            # Extract common columns for display
+            if 'Account_XTP' in merged.columns or 'Account_JPM' in merged.columns:
+                merged['Account'] = merged.get('Account_XTP', pd.Series()).fillna(merged.get('Account_JPM', pd.Series()))
+            if 'Product_Code_XTP' in merged.columns or 'Product_Code_JPM' in merged.columns:
+                merged['Product_Code'] = merged.get('Product_Code_XTP', pd.Series()).fillna(merged.get('Product_Code_JPM', pd.Series()))
+            if 'Strike_Price_Adjusted_XTP' in merged.columns or 'Strike_Price_Adjusted_JPM' in merged.columns:
+                merged['Strike_Price_Adjusted'] = merged.get('Strike_Price_Adjusted_XTP', pd.Series()).fillna(
+                    merged.get('Strike_Price_Adjusted_JPM', pd.Series())
+                )
+            if 'Settlement_Price_Adjusted_XTP' in merged.columns or 'Settlement_Price_Adjusted_JPM' in merged.columns:
+                merged['Settlement_Price_Adjusted'] = merged.get('Settlement_Price_Adjusted_XTP', pd.Series()).fillna(
+                    merged.get('Settlement_Price_Adjusted_JPM', pd.Series())
+                )
+            # Extract Call/Put for display (keep separate XTP and JPM columns)
+            if 'Call_Put_XTP' in merged.columns:
+                merged['Call_Put_XTP'] = merged['Call_Put_XTP']
+            if 'Call_Put_JPM' in merged.columns:
+                merged['Call_Put_JPM'] = merged['Call_Put_JPM']
         
         # Prepare results
         results = {
-            'merged': merged,
-            'xtp_detail': xtp_df,
-            'jpm_detail': jpm_df,
+            'merged': merged if len(xtp_agg) > 0 or len(jpm_agg) > 0 else pd.DataFrame(),
+            'xtp_detail': xtp_complete,
+            'jpm_detail': jpm_complete,
+            'xtp_incomplete': xtp_incomplete,
+            'jpm_incomplete': jpm_incomplete,
             'xtp_agg': xtp_agg,
             'jpm_agg': jpm_agg,
             'strike_multipliers': self.strike_multipliers,
@@ -591,12 +786,16 @@ class ReconciliationTool:
     
     def generate_summary_stats(self, results: Dict) -> pd.DataFrame:
         """Generate summary statistics"""
-        merged = results['merged']
+        merged = results.get('merged', pd.DataFrame())
+        xtp_incomplete_count = len(results.get('xtp_incomplete', pd.DataFrame()))
+        jpm_incomplete_count = len(results.get('jpm_incomplete', pd.DataFrame()))
         
         stats = {
             'Metric': [
-                'Total XTP Records',
-                'Total JPM Records',
+                'Total XTP Records (Complete)',
+                'Total JPM Records (Complete)',
+                'XTP Records with Missing Data',
+                'JPM Records with Missing Data',
                 'Total Unique Groups',
                 'Matched Groups',
                 'Quantity Mismatch Groups',
@@ -606,15 +805,17 @@ class ReconciliationTool:
                 'Products Using Default Multipliers'
             ],
             'Value': [
-                len(results['xtp_detail']),
-                len(results['jpm_detail']),
-                len(merged),
-                len(merged[merged['Status'] == 'Matched']),
-                len(merged[merged['Status'] == 'Qty Mismatch']),
-                len(merged[merged['Status'] == 'XTP Only']),
-                len(merged[merged['Status'] == 'JPM Only']),
-                f"{(len(merged[merged['Status'] == 'Matched']) / len(merged) * 100):.2f}%" if len(merged) > 0 else "0%",
-                len(results['products_with_default_multipliers'])
+                len(results.get('xtp_detail', pd.DataFrame())),
+                len(results.get('jpm_detail', pd.DataFrame())),
+                xtp_incomplete_count,
+                jpm_incomplete_count,
+                len(merged) if len(merged) > 0 else 0,
+                len(merged[merged['Status'] == 'Matched']) if len(merged) > 0 and 'Status' in merged.columns else 0,
+                len(merged[merged['Status'] == 'Qty Mismatch']) if len(merged) > 0 and 'Status' in merged.columns else 0,
+                len(merged[merged['Status'] == 'XTP Only']) if len(merged) > 0 and 'Status' in merged.columns else 0,
+                len(merged[merged['Status'] == 'JPM Only']) if len(merged) > 0 and 'Status' in merged.columns else 0,
+                f"{(len(merged[merged['Status'] == 'Matched']) / len(merged) * 100):.2f}%" if len(merged) > 0 and 'Status' in merged.columns else "0%",
+                len(results.get('products_with_default_multipliers', set()))
             ]
         }
         
@@ -633,40 +834,76 @@ class ReconciliationTool:
         merged = results['merged']
         
         # Prepare matched positions
-        matched = merged[merged['Status'] == 'Matched'].copy()
-        matched_display = matched[[
-            'Account', 'Product_Code', 'Strike_Price_XTP', 'Strike_Price_Adjusted',
-            'Settlement_Price_XTP', 'Settlement_Price_Adjusted',
-            'Quantity_XTP', 'Quantity_JPM', 'Quantity_Difference', 'Status'
-        ]].copy()
-        matched_display.columns = [
-            'Account', 'Product Code', 'Strike Price (Original)', 'Strike Price (Adjusted)',
-            'Settlement Price (Original)', 'Settlement Price (Adjusted)',
-            'XTP Quantity', 'JPM Quantity', 'Quantity Difference', 'Match Status'
-        ]
+        if len(merged) > 0 and 'Status' in merged.columns:
+            matched = merged[merged['Status'] == 'Matched'].copy()
+            if len(matched) > 0:
+                # Select columns including Call/Put if available
+                display_cols = [
+                    'Account', 'Product_Code', 'Strike_Price_XTP', 'Strike_Price_Adjusted',
+                    'Settlement_Price_XTP', 'Settlement_Price_Adjusted',
+                    'Quantity_XTP', 'Quantity_JPM', 'Quantity_Difference', 'Status'
+                ]
+                col_names = [
+                    'Account', 'Product Code', 'Strike Price (Original)', 'Strike Price (Adjusted)',
+                    'Settlement Price (Original)', 'Settlement Price (Adjusted)',
+                    'XTP Quantity', 'JPM Quantity', 'Quantity Difference', 'Match Status'
+                ]
+                
+                # Add Call/Put columns if available
+                if 'Call_Put_XTP' in matched.columns and 'Call_Put_JPM' in matched.columns:
+                    display_cols.insert(-1, 'Call_Put_XTP')
+                    display_cols.insert(-1, 'Call_Put_JPM')
+                    col_names.insert(-2, 'Call/Put (XTP)')
+                    col_names.insert(-2, 'Call/Put (JPM)')
+                
+                available_cols = [col for col in display_cols if col in matched.columns]
+                matched_display = matched[available_cols].copy()
+                matched_display.columns = col_names[:len(available_cols)]
+            else:
+                matched_display = pd.DataFrame()
+        else:
+            matched_display = pd.DataFrame()
         
         # Prepare unmatched positions (combined view)
-        unmatched = merged[merged['Status'] != 'Matched'].copy()
-        
-        # Sort unmatched by Status, then by absolute Difference (descending)
-        unmatched['Abs_Difference'] = unmatched['Quantity_Difference'].abs()
-        unmatched = unmatched.sort_values(
-            by=['Status', 'Abs_Difference'],
-            ascending=[True, False]
-        )
-        
-        unmatched_display = unmatched[[
-            'Account', 'Product_Code', 'Strike_Price_Adjusted', 'Settlement_Price_Adjusted',
-            'Quantity_XTP', 'Quantity_JPM', 'Quantity_Difference', 'Status'
-        ]].copy()
-        unmatched_display.columns = [
-            'Account', 'Product Code', 'Strike Price (Adjusted)', 'Settlement Price (Adjusted)',
-            'XTP Quantity', 'JPM Quantity', 'Difference', 'Status'
-        ]
-        
-        # Replace 0 with blank for better readability
-        unmatched_display['XTP Quantity'] = unmatched_display['XTP Quantity'].replace(0, '')
-        unmatched_display['JPM Quantity'] = unmatched_display['JPM Quantity'].replace(0, '')
+        if len(merged) > 0 and 'Status' in merged.columns:
+            unmatched = merged[merged['Status'] != 'Matched'].copy()
+            
+            if len(unmatched) > 0:
+                # Sort unmatched by Status, then by absolute Difference (descending)
+                unmatched['Abs_Difference'] = unmatched['Quantity_Difference'].abs()
+                unmatched = unmatched.sort_values(
+                    by=['Status', 'Abs_Difference'],
+                    ascending=[True, False]
+                )
+                
+                # Select columns including Call/Put if available
+                display_cols = [
+                    'Account', 'Product_Code', 'Strike_Price_Adjusted', 'Settlement_Price_Adjusted',
+                    'Quantity_XTP', 'Quantity_JPM', 'Quantity_Difference', 'Status'
+                ]
+                col_names = [
+                    'Account', 'Product Code', 'Strike Price (Adjusted)', 'Settlement Price (Adjusted)',
+                    'XTP Quantity', 'JPM Quantity', 'Difference', 'Status'
+                ]
+                
+                # Add Call/Put columns if available
+                if 'Call_Put_XTP' in unmatched.columns and 'Call_Put_JPM' in unmatched.columns:
+                    display_cols.insert(-1, 'Call_Put_XTP')
+                    display_cols.insert(-1, 'Call_Put_JPM')
+                    col_names.insert(-2, 'Call/Put (XTP)')
+                    col_names.insert(-2, 'Call/Put (JPM)')
+                
+                available_cols = [col for col in display_cols if col in unmatched.columns]
+                unmatched_display = unmatched[available_cols].copy()
+                unmatched_display.columns = col_names[:len(available_cols)]
+                
+                # Replace 0 with blank for better readability
+                unmatched_display['XTP Quantity'] = unmatched_display['XTP Quantity'].replace(0, '')
+                unmatched_display['JPM Quantity'] = unmatched_display['JPM Quantity'].replace(0, '')
+            else:
+                unmatched_display = pd.DataFrame()
+        else:
+            unmatched_display = pd.DataFrame()
         
         # Prepare detail breakdown for mismatches
         detail_breakdown = []
@@ -729,6 +966,40 @@ class ReconciliationTool:
         
         detail_df = pd.DataFrame(detail_breakdown) if detail_breakdown else pd.DataFrame()
         
+        # Prepare incomplete records tab
+        incomplete_records = []
+        
+        # Add XTP incomplete records
+        if 'xtp_incomplete' in results and len(results['xtp_incomplete']) > 0:
+            xtp_incomp = results['xtp_incomplete'].copy()
+            # Select relevant columns for display
+            display_cols = ['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity']
+            available_cols = [col for col in display_cols if col in xtp_incomp.columns]
+            if available_cols:
+                xtp_incomp_display = xtp_incomp[available_cols].copy()
+                xtp_incomp_display['Source'] = 'XTP'
+                incomplete_records.append(xtp_incomp_display)
+        
+        # Add JPM incomplete records
+        if 'jpm_incomplete' in results and len(results['jpm_incomplete']) > 0:
+            jpm_incomp = results['jpm_incomplete'].copy()
+            # Select relevant columns for display
+            display_cols = ['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity']
+            available_cols = [col for col in display_cols if col in jpm_incomp.columns]
+            if available_cols:
+                jpm_incomp_display = jpm_incomp[available_cols].copy()
+                jpm_incomp_display['Source'] = 'JPM'
+                incomplete_records.append(jpm_incomp_display)
+        
+        # Combine incomplete records
+        if incomplete_records:
+            incomplete_df = pd.concat(incomplete_records, ignore_index=True)
+            incomplete_df.columns = [
+                'Account', 'Product Code', 'Strike Price', 'Settlement Price', 'Quantity', 'Source'
+            ]
+        else:
+            incomplete_df = pd.DataFrame(columns=['Account', 'Product Code', 'Strike Price', 'Settlement Price', 'Quantity', 'Source'])
+        
         # Generate summary statistics
         summary_stats = self.generate_summary_stats(results)
         
@@ -749,8 +1020,27 @@ class ReconciliationTool:
         
         # Export to Excel with multiple sheets
         with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-            matched_display.to_excel(writer, sheet_name='Matched', index=False)
-            unmatched_display.to_excel(writer, sheet_name='Unmatched_All', index=False)
+            if len(matched_display) > 0:
+                matched_display.to_excel(writer, sheet_name='Matched', index=False)
+            else:
+                pd.DataFrame(columns=['Account', 'Product Code', 'Strike Price (Original)', 'Strike Price (Adjusted)',
+                                    'Settlement Price (Original)', 'Settlement Price (Adjusted)',
+                                    'XTP Quantity', 'JPM Quantity', 'Quantity Difference', 'Match Status']).to_excel(
+                    writer, sheet_name='Matched', index=False)
+            
+            if len(unmatched_display) > 0:
+                unmatched_display.to_excel(writer, sheet_name='Unmatched_All', index=False)
+            else:
+                pd.DataFrame(columns=['Account', 'Product Code', 'Strike Price (Adjusted)', 'Settlement Price (Adjusted)',
+                                    'XTP Quantity', 'JPM Quantity', 'Difference', 'Status']).to_excel(
+                    writer, sheet_name='Unmatched_All', index=False)
+            
+            if len(incomplete_df) > 0:
+                incomplete_df.to_excel(writer, sheet_name='Incomplete_Records', index=False)
+            else:
+                pd.DataFrame(columns=['Account', 'Product Code', 'Strike Price', 'Settlement Price', 'Quantity', 'Source']).to_excel(
+                    writer, sheet_name='Incomplete_Records', index=False)
+            
             if len(detail_df) > 0:
                 detail_df.to_excel(writer, sheet_name='Detail_Breakdown', index=False)
             summary_stats.to_excel(writer, sheet_name='Summary', index=False)
