@@ -93,9 +93,36 @@ Required columns (exact names preferred, with fallback to flexible matching):
 - **Settlement_Price**: Settlement price value
 - **Quantity**: Position quantity (flexible matching for "Qty" or "Quantity")
 
-## Multiplier Configuration Files
+## Multiplier Configuration
 
-### strike_multipliers.csv
+You can apply **strike** and **settlement** price multipliers **independently for XTP and JPM**.
+
+### Option 1: Combined file (independent XTP vs JPM)
+
+Use a single CSV with four multiplier columns so strike and settle can differ by source:
+
+**File**: `config/multipliers.csv` (or pass `--multipliers-file path/to/multipliers.csv`)
+
+```csv
+Product_Code,Strike_Mult_XTP,Strike_Mult_JPM,Settle_Mult_XTP,Settle_Mult_JPM
+ES,1,1,1,1
+NQ,0.01,0.01,0.01,0.01
+GC,0.1,0.1,0.1,0.1
+CL,1,1,1,1
+```
+
+- **Strike_Mult_XTP** / **Strike_Mult_JPM**: applied to XTP and JPM strike prices respectively.
+- **Settle_Mult_XTP** / **Settle_Mult_JPM**: applied to XTP and JPM settlement prices respectively.
+
+If `config/multipliers.csv` exists (or you pass `--multipliers-file`), this file is used and the legacy strike/settle files below are ignored.
+
+A template is in `config/multipliers.example.csv`; copy to `config/multipliers.csv` to use it.
+
+### Option 2: Legacy (same multiplier for both sides)
+
+If the combined file is not used, the tool falls back to two files. The **same** multiplier is applied to both XTP and JPM for that price type.
+
+**strike_multipliers.csv**
 
 ```csv
 Product_Code,Multiplier
@@ -105,7 +132,7 @@ GC,0.1
 CL,1
 ```
 
-### settle_multipliers.csv
+**settle_multipliers.csv**
 
 ```csv
 Product_Code,Multiplier
