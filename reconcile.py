@@ -53,9 +53,14 @@ class ReconciliationTool:
         # Initialize logging
         self._setup_logging()
         
-        # Load multipliers
-        self.strike_multipliers = {}
-        self.settle_multipliers = {}
+        # Multipliers: independent per source (XTP/JPM) and price type (strike/settle)
+        # Keys: 'strike_xtp', 'strike_jpm', 'settle_xtp', 'settle_jpm' -> each maps product_code -> float
+        self.multipliers = {
+            'strike_xtp': {},
+            'strike_jpm': {},
+            'settle_xtp': {},
+            'settle_jpm': {},
+        }
         self.products_with_default_multipliers = set()
         
         self.logger.info("Reconciliation Tool initialized")
@@ -76,62 +81,47 @@ class ReconciliationTool:
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"Logging initialized: {log_file}")
     
-    def load_multipliers(self, strike_file: Optional[str] = None, 
-                        settle_file: Optional[str] = None) -> Tuple[Dict, Dict]:
+    def load_multipliers(self, strike_file: Optional[str] = None,
+                        settle_file: Optional[str] = None,
+                        multipliers_file: Optional[str] = None) -> Dict[str, Dict[str, float]]:
         """
-        Load multiplier tables from CSV files
-        
-        Args:
-            strike_file: Path to strike multipliers CSV (default: config/strike_multipliers.csv)
-            settle_file: Path to settlement multipliers CSV (default: config/settle_multipliers.csv)
-        
+        Load multiplier tables. Supports two modes:
+
+        1) Combined file (multipliers_file): one CSV with columns
+           Product_Code, Strike_Mult_XTP, Strike_Mult_JPM, Settle_Mult_XTP, Settle_Mult_JPM
+           so strike/settle can be set independently for XTP vs JPM.
+
+        2) Legacy (strike_file + settle_file): separate strike and settle CSVs with
+           Product_Code, Multiplier — same multiplier is used for both XTP and JPM
+           for that price type.
+
         Returns:
-            Tuple of (strike_multipliers dict, settle_multipliers dict)
+            self.multipliers dict with keys strike_xtp, strike_jpm, settle_xtp, settle_jpm
         """
-        strike_file = strike_file or self.config_dir / "strike_multipliers.csv"
-        settle_file = settle_file or self.config_dir / "settle_multipliers.csv"
-        
-        # Create template files if they don't exist
-        if not Path(strike_file).exists():
-            self.logger.warning(f"Strike multipliers file not found: {strike_file}")
-            self.logger.info("Creating template strike_multipliers.csv")
-            self._create_template_multiplier_file(strike_file, "strike")
-        
-        if not Path(settle_file).exists():
-            self.logger.warning(f"Settlement multipliers file not found: {settle_file}")
-            self.logger.info("Creating template settle_multipliers.csv")
-            self._create_template_multiplier_file(settle_file, "settlement")
-        
-        # Load strike multipliers
-        try:
-            strike_df = pd.read_csv(strike_file)
-            self._validate_multiplier_file(strike_df, "strike")
-            self.strike_multipliers = dict(zip(
-                strike_df['Product_Code'].astype(str).str.upper(),
-                pd.to_numeric(strike_df['Multiplier'], errors='coerce')
-            ))
-            self.logger.info(f"Loaded {len(self.strike_multipliers)} strike multipliers from {strike_file}")
-        except Exception as e:
-            self.logger.error(f"Error loading strike multipliers: {e}")
-            raise
-        
-        # Load settlement multipliers
-        try:
-            settle_df = pd.read_csv(settle_file)
-            self._validate_multiplier_file(settle_df, "settlement")
-            self.settle_multipliers = dict(zip(
-                settle_df['Product_Code'].astype(str).str.upper(),
-                pd.to_numeric(settle_df['Multiplier'], errors='coerce')
-            ))
-            self.logger.info(f"Loaded {len(self.settle_multipliers)} settlement multipliers from {settle_file}")
-        except Exception as e:
-            self.logger.error(f"Error loading settlement multipliers: {e}")
-            raise
-        
-        return self.strike_multipliers, self.settle_multipliers
+        combined_path = Path(multipliers_file) if multipliers_file else self.config_dir / "multipliers.csv"
+        strike_path = Path(strike_file) if strike_file else self.config_dir / "strike_multipliers.csv"
+        settle_path = Path(settle_file) if settle_file else self.config_dir / "settle_multipliers.csv"
+
+        # Prefer combined file if it exists (or was explicitly passed)
+        if multipliers_file or combined_path.exists():
+            path = Path(multipliers_file) if multipliers_file else combined_path
+            if not path.exists():
+                self.logger.warning(f"Multipliers file not found: {path}")
+                self._create_template_combined_multipliers(path)
+            self._load_combined_multipliers(path)
+            return self.multipliers
+        # Legacy: separate strike and settle files
+        if not strike_path.exists():
+            self.logger.warning(f"Strike multipliers file not found: {strike_path}")
+            self._create_template_multiplier_file(strike_path, "strike")
+        if not settle_path.exists():
+            self.logger.warning(f"Settlement multipliers file not found: {settle_path}")
+            self._create_template_multiplier_file(settle_path, "settlement")
+        self._load_legacy_multipliers(strike_path, settle_path)
+        return self.multipliers
     
     def _create_template_multiplier_file(self, filepath: Path, multiplier_type: str):
-        """Create a template multiplier CSV file"""
+        """Create a template multiplier CSV file (legacy: single Multiplier column)."""
         template_data = {
             'Product_Code': ['ES', 'NQ', 'GC', 'CL'],
             'Multiplier': [1, 0.01, 0.1, 1]
@@ -139,6 +129,52 @@ class ReconciliationTool:
         df = pd.DataFrame(template_data)
         df.to_csv(filepath, index=False)
         self.logger.info(f"Created template {multiplier_type} multiplier file: {filepath}")
+
+    def _create_template_combined_multipliers(self, filepath: Path):
+        """Create template combined multipliers CSV (XTP/JPM independent)."""
+        template_data = {
+            'Product_Code': ['ES', 'NQ', 'GC', 'CL'],
+            'Strike_Mult_XTP': [1, 0.01, 0.1, 1],
+            'Strike_Mult_JPM': [1, 0.01, 0.1, 1],
+            'Settle_Mult_XTP': [1, 0.01, 0.1, 1],
+            'Settle_Mult_JPM': [1, 0.01, 0.1, 1],
+        }
+        df = pd.DataFrame(template_data)
+        df.to_csv(filepath, index=False)
+        self.logger.info(f"Created template combined multipliers file: {filepath}")
+
+    def _load_combined_multipliers(self, filepath: Path):
+        """Load combined multipliers CSV with columns Strike_Mult_XTP, Strike_Mult_JPM, Settle_Mult_XTP, Settle_Mult_JPM."""
+        required = ['Product_Code', 'Strike_Mult_XTP', 'Strike_Mult_JPM', 'Settle_Mult_XTP', 'Settle_Mult_JPM']
+        df = pd.read_csv(filepath)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Combined multipliers file missing columns: {missing}")
+        products = df['Product_Code'].astype(str).str.upper()
+        for key, col in [('strike_xtp', 'Strike_Mult_XTP'), ('strike_jpm', 'Strike_Mult_JPM'),
+                         ('settle_xtp', 'Settle_Mult_XTP'), ('settle_jpm', 'Settle_Mult_JPM')]:
+            self.multipliers[key] = dict(zip(products, pd.to_numeric(df[col], errors='coerce').fillna(1.0)))
+        self.logger.info(f"Loaded combined multipliers from {filepath} for {len(products)} products")
+
+    def _load_legacy_multipliers(self, strike_path: Path, settle_path: Path):
+        """Load legacy strike and settle CSVs; apply same multiplier to both XTP and JPM."""
+        strike_df = pd.read_csv(strike_path)
+        self._validate_multiplier_file(strike_df, "strike")
+        strike_vals = dict(zip(
+            strike_df['Product_Code'].astype(str).str.upper(),
+            pd.to_numeric(strike_df['Multiplier'], errors='coerce')
+        ))
+        settle_df = pd.read_csv(settle_path)
+        self._validate_multiplier_file(settle_df, "settlement")
+        settle_vals = dict(zip(
+            settle_df['Product_Code'].astype(str).str.upper(),
+            pd.to_numeric(settle_df['Multiplier'], errors='coerce')
+        ))
+        self.multipliers['strike_xtp'] = dict(strike_vals)
+        self.multipliers['strike_jpm'] = dict(strike_vals)
+        self.multipliers['settle_xtp'] = dict(settle_vals)
+        self.multipliers['settle_jpm'] = dict(settle_vals)
+        self.logger.info("Loaded legacy strike/settle multipliers (same values for XTP and JPM)")
     
     def _validate_multiplier_file(self, df: pd.DataFrame, file_type: str):
         """Validate multiplier file structure and data"""
@@ -155,29 +191,30 @@ class ReconciliationTool:
         
         self.logger.info(f"Validated {file_type} multiplier file: {len(df)} products")
     
-    def get_multiplier(self, product_code: str, multiplier_type: str = 'strike') -> float:
+    def get_multiplier(self, product_code: str, price_type: str, source: str) -> float:
         """
-        Get multiplier for a product code
+        Get multiplier for a product code, applied to either XTP or JPM and to strike or settle.
         
         Args:
             product_code: Product code to look up
-            multiplier_type: 'strike' or 'settle'
+            price_type: 'strike' or 'settle'
+            source: 'XTP' or 'JPM'
         
         Returns:
             Multiplier value (default: 1.0 if not found)
         """
         product_code = str(product_code).upper().strip()
-        multipliers = self.strike_multipliers if multiplier_type == 'strike' else self.settle_multipliers
+        key = f"{price_type}_{source.lower()}"
+        multipliers = self.multipliers.get(key, {})
         
         if product_code not in multipliers:
             if product_code not in self.products_with_default_multipliers:
                 self.logger.warning(
-                    f"Product code '{product_code}' not found in {multiplier_type} multipliers. "
+                    f"Product code '{product_code}' not found in {price_type} multipliers for {source}. "
                     f"Using default multiplier of 1.0"
                 )
                 self.products_with_default_multipliers.add(product_code)
             return 1.0
-        
         return multipliers[product_code]
     
     def load_position_file(self, filepath: str, file_type: str) -> pd.DataFrame:
@@ -289,17 +326,6 @@ class ReconciliationTool:
             if ('qty' in col_lower or 'quantity' in col_lower) and 'Quantity' not in column_mapping.values():
                 column_mapping[col] = 'Quantity'
         
-        # Call/Put: "Call / Put" (exact match first)
-        if 'Call / Put' in df.columns:
-            column_mapping['Call / Put'] = 'Call_Put'
-        else:
-            # Fall back to flexible matching
-            for col in df.columns:
-                col_lower = col.lower()
-                if ('call' in col_lower or 'put' in col_lower) and 'Call_Put' not in column_mapping.values():
-                    column_mapping[col] = 'Call_Put'
-                    break
-        
         df = df.rename(columns=column_mapping)
         
         # Log which columns were used
@@ -321,17 +347,6 @@ class ReconciliationTool:
         df['Settlement_Price'] = pd.to_numeric(df['Settlement_Price'], errors='coerce')
         df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
         
-        # Normalize Call/Put values: Call -> C, Put -> P, blank/other -> None
-        if 'Call_Put' in df.columns:
-            df['Call_Put'] = df['Call_Put'].astype(str).str.strip().str.upper()
-            # Map Call to C, Put to P, everything else to None
-            df['Call_Put_Normalized'] = df['Call_Put'].apply(
-                lambda x: 'C' if x == 'CALL' else ('P' if x == 'PUT' else None)
-            )
-        else:
-            df['Call_Put'] = None
-            df['Call_Put_Normalized'] = None
-        
         # Identify rows with missing critical data (but keep them)
         critical_cols = ['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity']
         df['_is_complete'] = df[critical_cols].notna().all(axis=1)
@@ -343,13 +358,13 @@ class ReconciliationTool:
         if len(df_incomplete) > 0:
             self.logger.info(f"Found {len(df_incomplete)} XTP records with missing data (will be in separate tab)")
         
-        # Apply multipliers only to complete records
+        # Apply multipliers only to complete records (XTP-specific multipliers)
         if len(df_complete) > 0:
             df_complete['Strike_Multiplier'] = df_complete['Product_Code'].apply(
-                lambda x: self.get_multiplier(x, 'strike')
+                lambda x: self.get_multiplier(x, 'strike', 'XTP')
             )
             df_complete['Settle_Multiplier'] = df_complete['Product_Code'].apply(
-                lambda x: self.get_multiplier(x, 'settle')
+                lambda x: self.get_multiplier(x, 'settle', 'XTP')
             )
             
             df_complete['Strike_Price_Adjusted'] = df_complete['Strike_Price'] * df_complete['Strike_Multiplier']
@@ -438,17 +453,6 @@ class ReconciliationTool:
             if ('qty' in col_lower or 'quantity' in col_lower) and 'Quantity' not in column_mapping.values():
                 column_mapping[col] = 'Quantity'
         
-        # Call/Put: "Call / Put" (exact match first)
-        if 'Call / Put' in df.columns:
-            column_mapping['Call / Put'] = 'Call_Put'
-        else:
-            # Fall back to flexible matching
-            for col in df.columns:
-                col_lower = col.lower()
-                if ('call' in col_lower or 'put' in col_lower) and 'Call_Put' not in column_mapping.values():
-                    column_mapping[col] = 'Call_Put'
-                    break
-        
         df = df.rename(columns=column_mapping)
         
         # Log which columns were used
@@ -468,17 +472,6 @@ class ReconciliationTool:
         df['Settlement_Price'] = pd.to_numeric(df['Settlement_Price'], errors='coerce')
         df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
         
-        # Normalize Call/Put values: C stays C, P stays P, blank/other -> None
-        if 'Call_Put' in df.columns:
-            df['Call_Put'] = df['Call_Put'].astype(str).str.strip().str.upper()
-            # Map C to C, P to P, everything else to None
-            df['Call_Put_Normalized'] = df['Call_Put'].apply(
-                lambda x: 'C' if x == 'C' else ('P' if x == 'P' else None)
-            )
-        else:
-            df['Call_Put'] = None
-            df['Call_Put_Normalized'] = None
-        
         # Identify rows with missing critical data (but keep them)
         critical_cols = ['Account', 'Product_Code', 'Strike_Price', 'Settlement_Price', 'Quantity']
         df['_is_complete'] = df[critical_cols].notna().all(axis=1)
@@ -490,13 +483,13 @@ class ReconciliationTool:
         if len(df_incomplete) > 0:
             self.logger.info(f"Found {len(df_incomplete)} JPM records with missing data (will be in separate tab)")
         
-        # Apply multipliers only to complete records
+        # Apply multipliers only to complete records (JPM-specific multipliers)
         if len(df_complete) > 0:
             df_complete['Strike_Multiplier'] = df_complete['Product_Code'].apply(
-                lambda x: self.get_multiplier(x, 'strike')
+                lambda x: self.get_multiplier(x, 'strike', 'JPM')
             )
             df_complete['Settle_Multiplier'] = df_complete['Product_Code'].apply(
-                lambda x: self.get_multiplier(x, 'settle')
+                lambda x: self.get_multiplier(x, 'settle', 'JPM')
             )
             
             df_complete['Strike_Price_Adjusted'] = df_complete['Strike_Price'] * df_complete['Strike_Multiplier']
@@ -532,67 +525,47 @@ class ReconciliationTool:
         """
         self.logger.info(f"Aggregating {source} positions...")
         
-        # Include Call_Put_Normalized in grouping if it exists
         group_cols = ['Account', 'Product_Code', 'Strike_Price_Adjusted', 'Settlement_Price_Adjusted']
-        if 'Call_Put_Normalized' in df.columns:
-            group_cols.append('Call_Put_Normalized')
         
         # Aggregate quantities
-        agg_dict = {
+        agg_df = df.groupby(group_cols, as_index=False).agg({
             'Quantity': 'sum',
             'Strike_Price': 'first',  # Keep original strike price for display
             'Settlement_Price': 'first',  # Keep original settlement price for display
             'Strike_Multiplier': 'first',
             'Settle_Multiplier': 'first'
-        }
-        
-        # Add Call_Put fields if they exist
-        if 'Call_Put' in df.columns:
-            agg_dict['Call_Put'] = 'first'
-        if 'Call_Put_Normalized' in df.columns:
-            agg_dict['Call_Put_Normalized'] = 'first'
-        
-        agg_df = df.groupby(group_cols, as_index=False).agg(agg_dict)
+        })
         
         # Store detail records for later breakdown
-        def get_detail_records(row):
-            conditions = [
-                (df['Account'] == row['Account']),
-                (df['Product_Code'] == row['Product_Code']),
-                (df['Strike_Price_Adjusted'] == row['Strike_Price_Adjusted']),
+        agg_df['_detail_records'] = agg_df.apply(
+            lambda row: df[
+                (df['Account'] == row['Account']) &
+                (df['Product_Code'] == row['Product_Code']) &
+                (df['Strike_Price_Adjusted'] == row['Strike_Price_Adjusted']) &
                 (df['Settlement_Price_Adjusted'] == row['Settlement_Price_Adjusted'])
-            ]
-            if 'Call_Put_Normalized' in df.columns and 'Call_Put_Normalized' in row.index:
-                # Match Call_Put_Normalized: if either is None, allow match; otherwise must match exactly
-                row_call_put = row.get('Call_Put_Normalized')
-                if pd.isna(row_call_put) or row_call_put is None:
-                    # Row has None, so match any Call_Put_Normalized
-                    pass  # Don't filter by Call_Put
-                else:
-                    # Row has value, match exact or None
-                    call_put_condition = (
-                        (df['Call_Put_Normalized'].fillna('*') == row_call_put) |
-                        (df['Call_Put_Normalized'].isna())
-                    )
-                    conditions.append(call_put_condition)
-            return df[pd.concat(conditions, axis=1).all(axis=1)].to_dict('records')
-        
-        agg_df['_detail_records'] = agg_df.apply(get_detail_records, axis=1)
+            ].to_dict('records'),
+            axis=1
+        )
         
         self.logger.info(f"Aggregated {len(df)} {source} records into {len(agg_df)} groups")
         return agg_df
     
-    def reconcile(self, xtp_file: str, jpm_file: str, 
+    def reconcile(self, xtp_file: str, jpm_file: str,
                   strike_mult_file: Optional[str] = None,
-                  settle_mult_file: Optional[str] = None) -> Dict:
+                  settle_mult_file: Optional[str] = None,
+                  multipliers_file: Optional[str] = None) -> Dict:
         """
-        Perform reconciliation between XTP and JPM positions
+        Perform reconciliation between XTP and JPM positions.
+        
+        Multipliers: use either multipliers_file (combined XTP/JPM independent)
+        or legacy strike_mult_file + settle_mult_file (same multiplier for both sides).
         
         Args:
             xtp_file: Path to XTP position file
             jpm_file: Path to JPM position file
-            strike_mult_file: Optional path to strike multipliers file
-            settle_mult_file: Optional path to settlement multipliers file
+            strike_mult_file: Optional path to legacy strike multipliers CSV
+            settle_mult_file: Optional path to legacy settlement multipliers CSV
+            multipliers_file: Optional path to combined multipliers CSV (Strike_Mult_XTP, Strike_Mult_JPM, etc.)
         
         Returns:
             Dictionary containing reconciliation results
@@ -601,8 +574,12 @@ class ReconciliationTool:
         self.logger.info("Starting Reconciliation")
         self.logger.info("=" * 80)
         
-        # Load multipliers
-        self.load_multipliers(strike_mult_file, settle_mult_file)
+        # Load multipliers (combined file preferred; else legacy strike + settle)
+        self.load_multipliers(
+            strike_file=strike_mult_file,
+            settle_file=settle_mult_file,
+            multipliers_file=multipliers_file
+        )
         
         # Load position files
         xtp_raw = self.load_position_file(xtp_file, 'XTP')
@@ -624,42 +601,8 @@ class ReconciliationTool:
         jpm_agg = self.aggregate_positions(jpm_complete, 'JPM') if len(jpm_complete) > 0 else pd.DataFrame()
         
         # Create matching keys and merge (only if we have data)
-        # Include Call_Put_Normalized in match key: if None/blank, use '*' to match with anything
-        # If both have C or P, they must match exactly
         if len(xtp_agg) > 0:
-            if 'Call_Put_Normalized' in xtp_agg.columns:
-                # Use '*' for None/blank (matches with anything), actual value for C/P
-                call_put_key = xtp_agg['Call_Put_Normalized'].fillna('*').astype(str)
-            else:
-                call_put_key = pd.Series(['*'] * len(xtp_agg))
-            
             xtp_agg['Match_Key'] = (
-                xtp_agg['Account'].astype(str) + '|' +
-                xtp_agg['Product_Code'].astype(str) + '|' +
-                xtp_agg['Strike_Price_Adjusted'].astype(str) + '|' +
-                xtp_agg['Settlement_Price_Adjusted'].astype(str) + '|' +
-                call_put_key
-            )
-        
-        if len(jpm_agg) > 0:
-            if 'Call_Put_Normalized' in jpm_agg.columns:
-                # Use '*' for None/blank (matches with anything), actual value for C/P
-                call_put_key = jpm_agg['Call_Put_Normalized'].fillna('*').astype(str)
-            else:
-                call_put_key = pd.Series(['*'] * len(jpm_agg))
-            
-            jpm_agg['Match_Key'] = (
-                jpm_agg['Account'].astype(str) + '|' +
-                jpm_agg['Product_Code'].astype(str) + '|' +
-                jpm_agg['Strike_Price_Adjusted'].astype(str) + '|' +
-                jpm_agg['Settlement_Price_Adjusted'].astype(str) + '|' +
-                call_put_key
-            )
-        
-        # Merge for comparison
-        # Use base match key (without Call/Put) and then filter by Call/Put rules
-        if len(xtp_agg) > 0:
-            xtp_agg['Base_Match_Key'] = (
                 xtp_agg['Account'].astype(str) + '|' +
                 xtp_agg['Product_Code'].astype(str) + '|' +
                 xtp_agg['Strike_Price_Adjusted'].astype(str) + '|' +
@@ -667,42 +610,22 @@ class ReconciliationTool:
             )
         
         if len(jpm_agg) > 0:
-            jpm_agg['Base_Match_Key'] = (
+            jpm_agg['Match_Key'] = (
                 jpm_agg['Account'].astype(str) + '|' +
                 jpm_agg['Product_Code'].astype(str) + '|' +
                 jpm_agg['Strike_Price_Adjusted'].astype(str) + '|' +
                 jpm_agg['Settlement_Price_Adjusted'].astype(str)
             )
         
+        # Merge for comparison
         if len(xtp_agg) > 0 and len(jpm_agg) > 0:
-            # Merge on base key first
             merged = pd.merge(
                 xtp_agg,
                 jpm_agg,
-                on='Base_Match_Key',
+                on='Match_Key',
                 how='outer',
                 suffixes=('_XTP', '_JPM')
             )
-            
-            # Apply Call/Put matching rules:
-            # - If both have C or P, they must match exactly
-            # - If either is None/blank, allow match (ignore Call/Put rule)
-            xtp_call_put = merged.get('Call_Put_Normalized_XTP', pd.Series([None] * len(merged)))
-            jpm_call_put = merged.get('Call_Put_Normalized_JPM', pd.Series([None] * len(merged)))
-            
-            # Fill None with '*' for comparison
-            xtp_call_put_filled = xtp_call_put.fillna('*')
-            jpm_call_put_filled = jpm_call_put.fillna('*')
-            
-            # Filter: keep rows where Call/Put matches OR either side is '*'
-            call_put_match = (
-                (xtp_call_put_filled == '*') |  # XTP is blank/None
-                (jpm_call_put_filled == '*') |  # JPM is blank/None
-                (xtp_call_put_filled == jpm_call_put_filled)  # Both match exactly
-            )
-            
-            # Keep only rows that match Call/Put rules
-            merged = merged[call_put_match].copy()
         elif len(xtp_agg) > 0:
             merged = xtp_agg.copy()
             merged['Quantity_JPM'] = 0
@@ -761,11 +684,6 @@ class ReconciliationTool:
                 merged['Settlement_Price_Adjusted'] = merged.get('Settlement_Price_Adjusted_XTP', pd.Series()).fillna(
                     merged.get('Settlement_Price_Adjusted_JPM', pd.Series())
                 )
-            # Extract Call/Put for display (keep separate XTP and JPM columns)
-            if 'Call_Put_XTP' in merged.columns:
-                merged['Call_Put_XTP'] = merged['Call_Put_XTP']
-            if 'Call_Put_JPM' in merged.columns:
-                merged['Call_Put_JPM'] = merged['Call_Put_JPM']
         
         # Prepare results
         results = {
@@ -776,8 +694,7 @@ class ReconciliationTool:
             'jpm_incomplete': jpm_incomplete,
             'xtp_agg': xtp_agg,
             'jpm_agg': jpm_agg,
-            'strike_multipliers': self.strike_multipliers,
-            'settle_multipliers': self.settle_multipliers,
+            'multipliers': self.multipliers,
             'products_with_default_multipliers': self.products_with_default_multipliers
         }
         
@@ -837,28 +754,16 @@ class ReconciliationTool:
         if len(merged) > 0 and 'Status' in merged.columns:
             matched = merged[merged['Status'] == 'Matched'].copy()
             if len(matched) > 0:
-                # Select columns including Call/Put if available
-                display_cols = [
+                matched_display = matched[[
                     'Account', 'Product_Code', 'Strike_Price_XTP', 'Strike_Price_Adjusted',
                     'Settlement_Price_XTP', 'Settlement_Price_Adjusted',
                     'Quantity_XTP', 'Quantity_JPM', 'Quantity_Difference', 'Status'
-                ]
-                col_names = [
+                ]].copy()
+                matched_display.columns = [
                     'Account', 'Product Code', 'Strike Price (Original)', 'Strike Price (Adjusted)',
                     'Settlement Price (Original)', 'Settlement Price (Adjusted)',
                     'XTP Quantity', 'JPM Quantity', 'Quantity Difference', 'Match Status'
                 ]
-                
-                # Add Call/Put columns if available
-                if 'Call_Put_XTP' in matched.columns and 'Call_Put_JPM' in matched.columns:
-                    display_cols.insert(-1, 'Call_Put_XTP')
-                    display_cols.insert(-1, 'Call_Put_JPM')
-                    col_names.insert(-2, 'Call/Put (XTP)')
-                    col_names.insert(-2, 'Call/Put (JPM)')
-                
-                available_cols = [col for col in display_cols if col in matched.columns]
-                matched_display = matched[available_cols].copy()
-                matched_display.columns = col_names[:len(available_cols)]
             else:
                 matched_display = pd.DataFrame()
         else:
@@ -876,26 +781,14 @@ class ReconciliationTool:
                     ascending=[True, False]
                 )
                 
-                # Select columns including Call/Put if available
-                display_cols = [
+                unmatched_display = unmatched[[
                     'Account', 'Product_Code', 'Strike_Price_Adjusted', 'Settlement_Price_Adjusted',
                     'Quantity_XTP', 'Quantity_JPM', 'Quantity_Difference', 'Status'
-                ]
-                col_names = [
+                ]].copy()
+                unmatched_display.columns = [
                     'Account', 'Product Code', 'Strike Price (Adjusted)', 'Settlement Price (Adjusted)',
                     'XTP Quantity', 'JPM Quantity', 'Difference', 'Status'
                 ]
-                
-                # Add Call/Put columns if available
-                if 'Call_Put_XTP' in unmatched.columns and 'Call_Put_JPM' in unmatched.columns:
-                    display_cols.insert(-1, 'Call_Put_XTP')
-                    display_cols.insert(-1, 'Call_Put_JPM')
-                    col_names.insert(-2, 'Call/Put (XTP)')
-                    col_names.insert(-2, 'Call/Put (JPM)')
-                
-                available_cols = [col for col in display_cols if col in unmatched.columns]
-                unmatched_display = unmatched[available_cols].copy()
-                unmatched_display.columns = col_names[:len(available_cols)]
                 
                 # Replace 0 with blank for better readability
                 unmatched_display['XTP Quantity'] = unmatched_display['XTP Quantity'].replace(0, '')
@@ -1003,20 +896,24 @@ class ReconciliationTool:
         # Generate summary statistics
         summary_stats = self.generate_summary_stats(results)
         
-        # Prepare multiplier config for audit trail
-        strike_mult_df = pd.DataFrame({
-            'Product_Code': list(results['strike_multipliers'].keys()),
-            'Multiplier': list(results['strike_multipliers'].values())
-        })
-        settle_mult_df = pd.DataFrame({
-            'Product_Code': list(results['settle_multipliers'].keys()),
-            'Multiplier': list(results['settle_multipliers'].values())
-        })
-        config_used = pd.concat([
-            strike_mult_df.assign(Multiplier_Type='Strike'),
-            settle_mult_df.assign(Multiplier_Type='Settlement')
-        ], ignore_index=True)
-        config_used = config_used[['Product_Code', 'Multiplier_Type', 'Multiplier']]
+        # Prepare multiplier config for audit trail (XTP and JPM independent)
+        mult = results.get('multipliers', {})
+        all_products = sorted(set(
+            list(mult.get('strike_xtp', {}).keys()) +
+            list(mult.get('strike_jpm', {}).keys()) +
+            list(mult.get('settle_xtp', {}).keys()) +
+            list(mult.get('settle_jpm', {}).keys())
+        ))
+        if not all_products:
+            config_used = pd.DataFrame(columns=['Product_Code', 'Strike_Mult_XTP', 'Strike_Mult_JPM', 'Settle_Mult_XTP', 'Settle_Mult_JPM'])
+        else:
+            config_used = pd.DataFrame({
+                'Product_Code': all_products,
+                'Strike_Mult_XTP': [mult.get('strike_xtp', {}).get(p, 1.0) for p in all_products],
+                'Strike_Mult_JPM': [mult.get('strike_jpm', {}).get(p, 1.0) for p in all_products],
+                'Settle_Mult_XTP': [mult.get('settle_xtp', {}).get(p, 1.0) for p in all_products],
+                'Settle_Mult_JPM': [mult.get('settle_jpm', {}).get(p, 1.0) for p in all_products],
+            })
         
         # Export to Excel with multiple sheets
         with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
@@ -1119,6 +1016,13 @@ def main():
     )
     
     parser.add_argument(
+        '--multipliers-file',
+        type=str,
+        default=None,
+        help='Path to combined multipliers CSV (Product_Code, Strike_Mult_XTP, Strike_Mult_JPM, Settle_Mult_XTP, Settle_Mult_JPM). If set, overrides strike/settle files.'
+    )
+    
+    parser.add_argument(
         '--output-dir',
         type=str,
         default='output',
@@ -1181,7 +1085,8 @@ def main():
             xtp_file=args.xtp_file,
             jpm_file=args.jpm_file,
             strike_mult_file=args.strike_multiplier_file,
-            settle_mult_file=args.settle_multiplier_file
+            settle_mult_file=args.settle_multiplier_file,
+            multipliers_file=args.multipliers_file
         )
         
         # Generate output filename
