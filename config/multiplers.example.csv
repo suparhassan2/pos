@@ -1,0 +1,5 @@
+Product_Code,Strike_Mult_XTP,Strike_Mult_JPM,Settle_Mult_XTP,Settle_Mult_JPM
+ES,1,1,1,1
+NQ,0.01,0.01,0.01,0.01
+GC,0.1,0.1,0.1,0.1
+CL,1,1,1,1
