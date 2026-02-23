@@ -1,0 +1,5 @@
+Product_Code,Strike_Multiplier,Settle_Multiplier
+ES,1.0,1.0
+NQ,0.01,0.01
+GC,0.1,0.1
+CL,1.0,1.0
