@@ -1,0 +1,16 @@
+// Paste this in a new Blank Query (Advanced Editor)
+let
+    fnGetMargin = (BookVal as text, CounterpartyVal as text) as any =>
+    let
+        MappingTable = MappingTable, // <-- replace with your actual mapping table name
+        Matched = Table.SelectRows(MappingTable, each 
+            Text.Lower([book]) = Text.Lower(BookVal) and 
+            Text.Lower([counterparty]) = Text.Lower(CounterpartyVal)
+        ),
+        Result = if Table.RowCount(Matched) > 0 
+                 then Matched{0}[margin] 
+                 else null
+    in
+        Result
+in
+    fnGetMargin
