@@ -30,6 +30,9 @@ class ReconciliationTool:
     # 'product_code_flexible': fn(col_lower)->bool  — last-resort Product_Code match
     _SOURCE_CONFIGS: Dict = {
         'XTP': {
+            # read_options are passed directly to pd.read_csv / pd.read_excel.
+            # header=1 means row 2 in Excel (0-indexed) contains the column names.
+            'read_options': {'header': 1},
             'exact': {
                 'Account':          'JPM Account',
                 'Strike_Price':     'Strike',
@@ -43,6 +46,19 @@ class ReconciliationTool:
                 'Quantity':         lambda c: 'qty' in c or 'quantity' in c,
             },
             'product_code_flexible': lambda c: ('clearing' in c or 'product' in c) and 'code' in c,
+            # Exclusion filters applied to raw source column names before standardization.
+            # Each rule: {'column': str, 'test': 'blank'|'in'|'startswith'|'endswith'|'contains',
+            #             'values': [str, ...]}   (values not needed for 'blank')
+            'exclusions': [
+                # Exclude rows where XTP Account starts with "HOC" or ends with "T"
+                {'column': 'XTP Account', 'test': 'startswith', 'values': ['HOC']},
+                {'column': 'XTP Account', 'test': 'endswith',   'values': ['T']},
+                # Exclude rows where JPM Account is blank or is account 12345
+                {'column': 'JPM Account', 'test': 'blank'},
+                {'column': 'JPM Account', 'test': 'in',         'values': ['12345']},
+                # Exclude rows where XTP Contract code contains CADBONDS
+                {'column': 'XTP Contract code', 'test': 'contains', 'values': ['CADBONDS']},
+            ],
         },
         'JPM': {
             'exact': {
@@ -51,6 +67,9 @@ class ReconciliationTool:
                 'Settlement_Price': 'Settlement_Price',
             },
             'product_code_cols': ['Product / Exchange Ticker'],
+            # Row-level fallbacks: if Product_Code is blank after primary assignment,
+            # try these columns in order until a non-blank value is found.
+            'product_code_fallbacks': ['Clearing Code'],
             'flexible': {
                 'Account':          lambda c: 'account' in c or ('jpm' in c and 'id' in c),
                 'Strike_Price':     lambda c: 'strike' in c,
@@ -58,6 +77,11 @@ class ReconciliationTool:
                 'Quantity':         lambda c: 'qty' in c or 'quantity' in c,
             },
             'product_code_flexible': lambda c: 'product' in c and ('code' in c or 'ticker' in c),
+            # Exclude specific JPM accounts
+            'exclusions': [
+                {'column': 'JPM ID / Broker ID', 'test': 'in',
+                 'values': ['1111', '2222', '2321', '23122']},
+            ],
         },
     }
 
@@ -235,12 +259,16 @@ class ReconciliationTool:
         if not filepath.exists():
             raise FileNotFoundError(f"{file_type} position file not found: {filepath}")
 
+        read_opts = self._SOURCE_CONFIGS.get(file_type, {}).get('read_options', {})
+        if read_opts:
+            self.logger.info(f"Applying read options for {file_type}: {read_opts}")
+
         self.logger.info(f"Loading {file_type} positions from: {filepath}")
         try:
             if filepath.suffix.lower() == '.csv':
-                df = pd.read_csv(filepath)
+                df = pd.read_csv(filepath, **read_opts)
             elif filepath.suffix.lower() in ['.xlsx', '.xls']:
-                df = pd.read_excel(filepath)
+                df = pd.read_excel(filepath, **read_opts)
             else:
                 raise ValueError(f"Unsupported file format: {filepath.suffix}")
             self.logger.info(f"Loaded {len(df)} records from {file_type} file")
@@ -249,6 +277,76 @@ class ReconciliationTool:
         except Exception as e:
             self.logger.error(f"Error loading {file_type} file: {e}")
             raise
+
+    def _apply_exclusions(self, df: pd.DataFrame, source: str) -> pd.DataFrame:
+        """
+        Apply pre-standardization exclusion filters defined in _SOURCE_CONFIGS[source]['exclusions'].
+
+        Each rule is a dict with:
+            column : str   — raw source column name to filter on
+            test   : str   — one of: 'blank', 'in', 'startswith', 'endswith', 'contains'
+            values : list  — list of strings to match against (not required for 'blank')
+
+        Matching is case-insensitive for 'contains'; case-sensitive for all others.
+        A warning is logged for any rule whose column is absent from the file.
+        """
+        rules = self._SOURCE_CONFIGS[source].get('exclusions', [])
+        if not rules:
+            return df
+
+        initial_len = len(df)
+
+        for rule in rules:
+            col = rule['column']
+            test = rule['test']
+
+            if col not in df.columns:
+                self.logger.warning(
+                    f"{source}: exclusion column '{col}' not found in file — rule skipped. "
+                    f"Available columns: {list(df.columns)}"
+                )
+                continue
+
+            before = len(df)
+
+            if test == 'blank':
+                # Keep rows where the column has a non-blank, non-null value
+                raw = df[col]
+                is_blank = raw.isna() | raw.astype(str).str.strip().isin(['', 'nan', 'NaN', 'None', 'none'])
+                df = df[~is_blank].copy()
+
+            else:
+                values = [str(v).strip() for v in rule.get('values', [])]
+                col_str = df[col].astype(str).str.strip()
+
+                if test == 'in':
+                    mask = ~col_str.isin(values)
+                elif test == 'startswith':
+                    mask = ~col_str.str.startswith(tuple(values))
+                elif test == 'endswith':
+                    mask = ~col_str.str.endswith(tuple(values))
+                elif test == 'contains':
+                    pattern = '|'.join(values)
+                    mask = ~col_str.str.contains(pattern, case=False, na=False, regex=True)
+                else:
+                    self.logger.warning(f"{source}: unknown exclusion test '{test}' — rule skipped")
+                    continue
+
+                df = df[mask].copy()
+
+            excluded = before - len(df)
+            if excluded > 0:
+                self.logger.info(
+                    f"{source}: excluded {excluded} row(s) — '{col}' {test}"
+                    + (f" {rule.get('values')}" if test != 'blank' else "")
+                )
+
+        total_excluded = initial_len - len(df)
+        if total_excluded > 0:
+            self.logger.info(
+                f"{source}: {total_excluded} row(s) excluded by filters; {len(df)} remaining"
+            )
+        return df
 
     def _prepare_data(self, df: pd.DataFrame, source: str) -> pd.DataFrame:
         """
@@ -271,6 +369,9 @@ class ReconciliationTool:
         self.logger.info(f"Preparing {source} data...")
         cfg = self._SOURCE_CONFIGS[source]
         df = df.copy()
+
+        # Apply exclusion filters on raw column names before any standardization
+        df = self._apply_exclusions(df, source)
 
         column_mapping: Dict[str, str] = {}
         already_mapped: set = set()
@@ -302,6 +403,22 @@ class ReconciliationTool:
                 f"{source} file must contain a product code column "
                 f"(tried: {cfg['product_code_cols']}). "
                 f"Available columns: {list(df.columns)}"
+            )
+
+        # Step 2b: Row-level fallbacks — fill blank Product_Code values from fallback columns
+        for fallback_col in cfg.get('product_code_fallbacks', []):
+            if fallback_col not in df.columns:
+                continue
+            blank_mask = df['Product_Code'].isna() | (df['Product_Code'].astype(str).str.strip() == '')
+            n_blank = blank_mask.sum()
+            if n_blank == 0:
+                break
+            df.loc[blank_mask, 'Product_Code'] = df.loc[blank_mask, fallback_col]
+            filled = blank_mask.sum() - (
+                df['Product_Code'].isna() | (df['Product_Code'].astype(str).str.strip() == '')
+            ).sum()
+            self.logger.info(
+                f"{source}: filled {filled} blank Product_Code row(s) from '{fallback_col}'"
             )
 
         # Step 3: Flexible matching for remaining standard columns
